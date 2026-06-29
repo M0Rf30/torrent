@@ -378,7 +378,7 @@ func (cl *Client) init(cfg *ClientConfig) {
 	}
 
 	cl.websocketTrackers = websocketTrackers{
-		PeerId: cl.peerID,
+		PeerId:  cl.peerID,
 		Slogger: cl.slogger.With("name", "websocketTrackers"),
 		GetAnnounceRequest: func(
 			event tracker.AnnounceEvent, infoHash [20]byte,

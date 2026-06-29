@@ -24,10 +24,10 @@ type AnnounceOpt = trHttp.AnnounceOpt
 type NewClientOpts struct {
 	Http trHttp.NewClientOpts
 	// Overrides the network in the scheme. Probably a legacy thing.
-	UdpNetwork   string
+	UdpNetwork string
 	// Deprecated: Use Slogger.
-	Logger  log.Logger
-	Slogger *slog.Logger
+	Logger       log.Logger
+	Slogger      *slog.Logger
 	ListenPacket func(network, addr string) (net.PacketConn, error)
 }
 

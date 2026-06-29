@@ -8,4 +8,4 @@ import typedRoaring "github.com/anacrolix/torrent/typed-roaring"
 func roaringBitmapRangeCardinality[T typedRoaring.BitConstraint](bm interface{ RangeCardinality(T, T) uint64 }, start, end T) (card uint64) {
 	card = bm.RangeCardinality(start, end)
 	return
-} 
+}
