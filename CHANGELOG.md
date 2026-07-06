@@ -12,6 +12,12 @@ All notable changes to [anacrolix/torrent](https://github.com/anacrolix/torrent)
 - Batch torrent input updates by doing them in the dispatcher
 - Close shared readers when storage is closed
 - Use `InsteadOf` and various other indexed improvements to manage announce overdue
+- Cache writable file handles in classic file storage IO to avoid repeated reopens, and reuse them for hashing reads
+- Track file-level piece completion so part-file promotion avoids full-range rescans
+- Defer persistent piece-completion writes into buffered, size/time-based checkpoints instead of syncing on every completed piece (ported from anacrolix/torrent#1051)
+- Resolve `TORRENT_STORAGE_DEFAULT_FILE_IO` lazily at storage-open time instead of at package init, so embedders can set it from their own startup code
+- Reset tracker announce state on torrent re-add so a removed-then-re-added torrent sends a fresh `Started` event instead of silently failing to rediscover peers (ported from anacrolix/torrent#1051)
+- Fix a data race between concurrent UDP tracker `Announce`/`Scrape` calls and connection-ID expiry/reconnect handling
 
 ## [v1.61.0] - 2025-12-17
 
