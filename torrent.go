@@ -2719,8 +2719,24 @@ func (t *Torrent) pieceHashed(piece pieceIndex, passed bool, hashIoErr error) {
 		if t.closed.IsSet() {
 			return
 		}
-		t.pendAllChunkSpecs(piece)
-		t.setPieceCompletion(piece, g.Some(true))
+		if err != nil {
+			// Fork-local fix (see CHANGELOG.md): MarkComplete failed, so storage never
+			// actually recorded this piece as complete. Blindly calling
+			// setPieceCompletion(true) below would let the in-memory state claim a
+			// success storage doesn't agree with; nothing else ever re-syncs it, and any
+			// non-responsive Reader waiting on this piece would block forever, since
+			// Reader.available() only unblocks once the piece is in t._completedPieces.
+			// Treat this exactly like a failed hash check instead (compare the "else"
+			// branch below): onIncompletePiece clears the piece's dirty chunks and
+			// re-requests them from peers, so it is naturally redownloaded and
+			// re-verified - retrying MarkComplete - rather than stuck forever claiming a
+			// completion storage never recorded.
+			t.onIncompletePiece(piece)
+			t.setPieceCompletion(piece, g.Some(false))
+		} else {
+			t.pendAllChunkSpecs(piece)
+			t.setPieceCompletion(piece, g.Some(true))
+		}
 	} else {
 		if len(p.dirtiers) != 0 && p.allChunksDirty() && hashIoErr == nil {
 			// Peers contributed to all the data for this piece hash failure, and the failure was
@@ -2773,6 +2789,27 @@ func (t *Torrent) pieceHashed(piece pieceIndex, passed bool, hashIoErr error) {
 		p.race++
 		err := p.Storage().MarkNotComplete()
 		if err != nil {
+			// Fork-local fix (see CHANGELOG.md): reviewed in the same pass that bounded
+			// the MarkComplete case above, but deliberately left proceeding unconditionally
+			// rather than changed to skip or re-derive the completion flip the way
+			// MarkComplete's failure now is. This piece just failed a hash check, so "not
+			// complete" is the only safe belief to hold in memory regardless of whether
+			// the write below persisted:
+			//   - Falling back to a fresh storage.Completion() read (as the MarkComplete
+			//     fix does) risks resurrecting a stale "complete" from before this
+			//     verification if the not-complete write itself never landed - i.e.
+			//     re-trusting data we just proved is bad.
+			//   - Marking completion "unknown" would make Piece.ignoreForRequests()
+			//     permanently skip this piece for new requests, since nothing else flips
+			//     storageCompletionOk back to true without an external resync - a new
+			//     stuck-forever state, worse than the one being fixed here.
+			// So the unconditional calls below are intentional, not an oversight. What's
+			// left unfixed is storage durability, not in-memory divergence: if Set() itself
+			// (as opposed to a downstream side effect) is what failed, the on-disk
+			// completion flag may stay stale ("complete") until this piece is naturally
+			// redownloaded and re-verified - onIncompletePiece below unconditionally clears
+			// its dirty chunks and re-requests it from peers, which retries
+			// MarkComplete/MarkNotComplete on the next verification pass.
 			t.slogger().Error("error marking piece not complete", "piece", piece, "err", err)
 		}
 		t.cl.lock()

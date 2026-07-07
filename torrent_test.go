@@ -301,3 +301,80 @@ func TestNextCompletionErrorStreakResetsFromZero(t *testing.T) {
 	qt.Assert(t, qt.Equals(streak, 2))
 	qt.Assert(t, qt.IsFalse(disable), qt.Commentf("streak must not have carried over the reset"))
 }
+
+// Fork-local fix (see CHANGELOG.md): pieceHashed used to call
+// p.Storage().MarkComplete(), log any error, and then unconditionally proceed to mark
+// the piece complete in memory anyway - so a storage write failure left memory falsely
+// believing a piece was persisted as complete when storage never recorded it, and
+// nothing ever re-synced the divergence. badStorage.MarkComplete always errors, so this
+// simulates that failure and proves the piece is instead treated like a failed hash
+// check: not marked complete, and returned to a re-downloadable (not all-dirty) state,
+// rather than getting stuck in an unrecoverable "believed complete but isn't" limbo.
+func TestPieceHashPassedMarkCompleteError(t *testing.T) {
+	mi := testutil.GreetingMetaInfo()
+	cl := newTestingClient(t)
+	tt := cl.newTorrent(mi.HashInfoBytes(), badStorage{})
+	tt.setChunkSize(2)
+	tt.cl.lock()
+	qt.Assert(t, qt.IsNil(tt.setInfoBytesLocked(mi.InfoBytes)))
+	tt.cl.unlock()
+	tt.cl.lock()
+	defer tt.cl.unlock()
+	// Force a known starting state (incomplete), overriding what badStorage's
+	// always-{Ok:true,Complete:true} Completion() would otherwise seed via the initial
+	// piece check triggered by setInfoBytesLocked above.
+	tt.setPieceCompletion(1, g.Some(false))
+	tt.dirtyChunks.AddRange(
+		uint64(tt.pieceRequestIndexBegin(1)),
+		uint64(tt.pieceRequestIndexBegin(1)+3))
+	qt.Assert(t, qt.IsTrue(tt.pieceAllDirty(1)))
+	qt.Assert(t, qt.IsFalse(tt.pieceComplete(1)), qt.Commentf("piece must start out incomplete"))
+
+	// badStorage.MarkComplete always fails; a hash pass must not be believed despite that.
+	tt.pieceHashed(1, true, nil)
+
+	qt.Assert(t, qt.IsFalse(tt.pieceComplete(1)),
+		qt.Commentf("MarkComplete failed - the piece must not be recorded complete in memory"))
+	// Dirty chunks should be cleared so the piece is redownloaded and re-verified,
+	// naturally retrying MarkComplete, instead of sitting complete-in-storage-terms (all
+	// chunks written) but permanently unmarked and unrequestable.
+	qt.Assert(t, qt.IsFalse(tt.pieceAllDirty(1)))
+}
+
+// Fork-local fix (see CHANGELOG.md): companion to TestPieceHashPassedMarkCompleteError,
+// covering the mirror MarkNotComplete path. Unlike the MarkComplete case, pieceHashed's
+// unconditional setPieceCompletion(false) call on a failed hash check was deliberately
+// NOT changed to skip or re-derive the flip (see the comment above it in torrent.go): a
+// failed hash check must always be believed incomplete in memory regardless of whether
+// persisting that fact to storage succeeded, since the alternative - re-deriving from
+// storage.Completion(), which badStorage (like a storage backend whose not-complete
+// write silently failed to land) always misreports as still complete - would let a
+// torrent keep trusting data it just proved was corrupt.
+func TestPieceHashFailedMarkNotCompleteErrorDoesNotResurrectComplete(t *testing.T) {
+	mi := testutil.GreetingMetaInfo()
+	cl := newTestingClient(t)
+	tt := cl.newTorrent(mi.HashInfoBytes(), badStorage{})
+	tt.setChunkSize(2)
+	tt.cl.lock()
+	qt.Assert(t, qt.IsNil(tt.setInfoBytesLocked(mi.InfoBytes)))
+	tt.cl.unlock()
+	tt.cl.lock()
+	defer tt.cl.unlock()
+	// Seed the cache as "confirmed complete", simulating a piece storage believed was
+	// done before this (re-)verification found it corrupt - the dangerous direction for
+	// a stale storage.Completion() read to resurrect.
+	tt.setPieceCompletion(1, g.Some(true))
+	qt.Assert(t, qt.IsTrue(tt.pieceComplete(1)))
+	tt.dirtyChunks.AddRange(
+		uint64(tt.pieceRequestIndexBegin(1)),
+		uint64(tt.pieceRequestIndexBegin(1)+3))
+
+	// badStorage.MarkNotComplete always fails, and its Completion() always claims
+	// {Ok: true, Complete: true} regardless - the worst case for a naive "re-read
+	// storage" fix, since it would resurrect the piece as complete.
+	tt.pieceHashed(1, false, nil)
+
+	qt.Assert(t, qt.IsFalse(tt.pieceComplete(1)),
+		qt.Commentf("a failed hash check must never leave the piece marked complete, "+
+			"even though MarkNotComplete failed and Completion() still (falsely) claims complete"))
+}

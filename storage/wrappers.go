@@ -128,8 +128,19 @@ func (p Piece) ReadAt(b []byte, off int64) (n int, err error) {
 	// to return if the data has been lost.
 	if off < p.mip.Length() {
 		if err == io.EOF {
-			// TODO: Hey, this guy over here isn't checking errors.
-			p.MarkNotComplete()
+			// Fork-local fix (see CHANGELOG.md): this used to call MarkNotComplete and
+			// discard its returned error entirely (not even logged). This generic wrapper
+			// has no logger for an arbitrary PieceImpl (unlike e.g. the file storage
+			// backend), and deliberately must not change the identity of the io.EOF we
+			// return here: it flows back through io.Copy/io.SectionReader (Piece.WriteTo)
+			// and reader.go's readAtAttempt, both of which compare against io.EOF by value
+			// rather than errors.Is, so wrapping or joining it would silently turn a
+			// handled, expected short-read signal into an unhandled hard error for those
+			// callers. The best we can safely do at this layer is make the failure
+			// observable instead of silently swallowed.
+			if markErr := p.MarkNotComplete(); markErr != nil {
+				packageExpvarMap.Add("readAtMarkNotCompleteErrors", 1)
+			}
 		}
 	}
 
