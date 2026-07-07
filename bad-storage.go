@@ -55,8 +55,19 @@ func (p badStoragePiece) MarkNotComplete() error {
 	return errors.New("psyyyyyyyche")
 }
 
+// randomlyTruncatedDataString simulates flaky-but-recovering storage: most calls return the
+// full content, but a minority independently truncate it, so a read at any offset converges to
+// success within a handful of attempts (matching reader.go's bounded maxStorageCapRetries retry
+// budget) instead of requiring an unbounded number of retries. The prior version drew a uniform
+// truncation length on every call (never full length), which made success for anything but the
+// very start of the piece a low-probability event per attempt (about 1/14 for the last byte) -
+// fine under the old unbounded-recursion behavior, but flaky/prone to spurious failure now that
+// storage-cap retries are capped (fork-local fix, see CHANGELOG.md).
 func (p badStoragePiece) randomlyTruncatedDataString() string {
-	return testutil.GreetingFileContents[:rand.Intn(14)]
+	if rand.Intn(4) == 0 {
+		return testutil.GreetingFileContents[:rand.Intn(14)]
+	}
+	return testutil.GreetingFileContents
 }
 
 func (p badStoragePiece) ReadAt(b []byte, off int64) (n int, err error) {

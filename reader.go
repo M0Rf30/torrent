@@ -310,9 +310,41 @@ func (r *reader) readOnceAt(ctx context.Context, b []byte, pos int64) (n int, er
 // Performs at most one successful read to torrent storage. Try reading, first with the storage
 // reader we already have, then after resetting it (in case data moved for
 // completed/incomplete/promoted etc.). Then try resetting the piece completions. Then after all
-// that if the storage is supposed to be flaky, try all over again. TODO: Filter errors and set log
-// levels appropriately.
+// that if the storage is supposed to be flaky, try all over again, up to maxStorageCapRetries
+// times.
+//
+// Fork-local fix: this used to recurse via r.readAt(ctx, b, pos) with no bound and no error-type
+// filtering whenever hasStorageCap() was true, so a persistent (non-transient) storage error would
+// recurse forever and hang playback. We now thread an attempt counter through the recursive calls
+// and cap it at maxStorageCapRetries, mirroring the bounded-retry philosophy of
+// pieceCompletionErrorDisableThreshold/nextCompletionErrorStreak in torrent.go: give transient
+// errors (lock contention, momentary I/O blips) a few chances, but never retry indefinitely. We
+// also check ctx between attempts so a cancelled caller doesn't wait through the whole retry
+// budget when data is already available (waitAvailable only observes ctx.Done() while blocked).
 func (r *reader) readAt(ctx context.Context, b []byte, pos int64) (n int, err error) {
+	return r.readAtAttempt(ctx, b, pos, 0)
+}
+
+// maxStorageCapRetries bounds how many times readAtAttempt will recurse when r.t.hasStorageCap()
+// is true and every read attempt so far has failed. Small and non-zero, matching the intent of
+// pieceCompletionErrorDisableThreshold: transient flakiness gets a fair chance, a persistent error
+// does not hang forever.
+const maxStorageCapRetries = 3
+
+// shouldRetryStorageCapRead decides whether readAtAttempt should recurse for another storage-cap
+// retry. Pure (aside from reading ctx.Err()) so the bounding logic is unit-testable without
+// constructing a Torrent, mirroring nextCompletionErrorStreak in torrent.go. If the caller's
+// context is already done, ctxErr is returned and retry is always false: no point spending the
+// retry budget on a read nobody wants anymore. Otherwise retry is true while attempt is still
+// under maxStorageCapRetries.
+func shouldRetryStorageCapRead(ctx context.Context, attempt int) (retry bool, ctxErr error) {
+	if ctxErr = ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	return attempt < maxStorageCapRetries, nil
+}
+
+func (r *reader) readAtAttempt(ctx context.Context, b []byte, pos int64, attempt int) (n int, err error) {
 	if pos >= r.length {
 		err = io.EOF
 		return
@@ -345,10 +377,24 @@ func (r *reader) readAt(ctx context.Context, b []byte, pos int64) (n int, err er
 	r.slogger().Error("read failed after completion resync", "err", err)
 
 	if r.t.hasStorageCap() {
-		// Ensure params weren't modified (Go sux). Recurse to detect infinite loops. TODO: I expect
-		// only some errors should pass through here, this might cause us to get stuck if we retry
-		// for any error.
-		return r.readAt(ctx, b, pos)
+		retry, ctxErr := shouldRetryStorageCapRead(ctx, attempt)
+		if ctxErr != nil {
+			// Bail out immediately if the caller gave up; no point burning retries on a read
+			// nobody wants anymore.
+			err = ctxErr
+			return
+		}
+		if !retry {
+			r.slogger().Error(
+				"giving up after exhausting storage cap retries",
+				"attempts", attempt+1,
+				"err", err,
+			)
+			return
+		}
+		// Ensure params weren't modified (Go sux). Recurse, bounded by maxStorageCapRetries, to
+		// give the flaky/capped storage a few more chances without risking an unbounded loop.
+		return r.readAtAttempt(ctx, b, pos, attempt+1)
 	}
 
 	// There should have been something available, avail != 0 here.

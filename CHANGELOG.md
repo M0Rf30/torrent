@@ -19,6 +19,7 @@ All notable changes to [anacrolix/torrent](https://github.com/anacrolix/torrent)
 - Reset tracker announce state on torrent re-add so a removed-then-re-added torrent sends a fresh `Started` event instead of silently failing to rediscover peers (ported from anacrolix/torrent#1051)
 - Fix a data race between concurrent UDP tracker `Announce`/`Scrape` calls and connection-ID expiry/reconnect handling
 - Tolerate a bounded number of consecutive piece-completion storage errors before disabling a torrent's data download, instead of permanently tripping on the very first one - a single transient hiccup (lock contention, a momentary I/O blip) used to disable an otherwise-healthy torrent for the rest of the process's life, since nothing calls the matching `AllowDataDownload` afterwards; any successful completion check resets the streak, so a genuinely persistent storage failure still correctly disables downloading as before (fork-local fix)
+- Bound `Reader.readAt`'s storage-cap retry recursion to `maxStorageCapRetries` (3) instead of recursing with no depth limit on every capped-storage read failure - a persistent (non-transient) storage error used to hang the reader/playback forever; a genuinely transient error still gets a few attempts, and the caller's context is now checked between attempts so a cancelled read doesn't burn through the whole retry budget (fork-local fix)
 
 ## [v1.61.0] - 2025-12-17
 
