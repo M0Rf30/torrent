@@ -246,3 +246,58 @@ func TestRelativeAvailabilityHaveNone(t *testing.T) {
 	tt.Drop()
 	tt.assertAllPiecesRelativeAvailabilityZero()
 }
+
+// Fork-local fix (see CHANGELOG.md): a single transient piece-completion
+// storage error must not permanently disable a torrent's data download -
+// only a streak of pieceCompletionErrorDisableThreshold CONSECUTIVE errors
+// should. nextCompletionErrorStreak is the pure decision function extracted
+// from setCachedPieceCompletionFromStorage specifically so this doesn't
+// require constructing a full Torrent/Client/storage stack to test.
+func TestNextCompletionErrorStreak(t *testing.T) {
+	qt.Assert(t, qt.Equals(pieceCompletionErrorDisableThreshold, 3),
+		qt.Commentf("test below is written against this specific threshold"))
+
+	streak := 0
+	var disable bool
+
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 1))
+	qt.Assert(t, qt.IsFalse(disable), qt.Commentf("a single error must not disable"))
+
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 2))
+	qt.Assert(t, qt.IsFalse(disable), qt.Commentf("two consecutive errors still below threshold"))
+
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 3))
+	qt.Assert(t, qt.IsTrue(disable), qt.Commentf("threshold reached: safety net must trip"))
+
+	// A persistently broken storage backend keeps tripping on every
+	// subsequent call (never gets "stuck" below threshold).
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 4))
+	qt.Assert(t, qt.IsTrue(disable))
+}
+
+// Any successful completion check resets the streak - this is
+// setCachedPieceCompletionFromStorage's responsibility (it sets
+// t.completionErrorStreak = 0 on the non-error branch), not
+// nextCompletionErrorStreak's; documented here since it's the behavior
+// that actually makes the fix "self-healing" rather than just "slower to
+// trip".
+func TestNextCompletionErrorStreakResetsFromZero(t *testing.T) {
+	// Simulates: 2 errors (below threshold), then a success resets the
+	// caller's streak variable to 0, then 2 more errors - still below
+	// threshold, proving the count didn't carry over.
+	streak, disable := nextCompletionErrorStreak(0)
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 2))
+	qt.Assert(t, qt.IsFalse(disable))
+
+	streak = 0 // what setCachedPieceCompletionFromStorage does on success
+
+	streak, disable = nextCompletionErrorStreak(streak)
+	streak, disable = nextCompletionErrorStreak(streak)
+	qt.Assert(t, qt.Equals(streak, 2))
+	qt.Assert(t, qt.IsFalse(disable), qt.Commentf("streak must not have carried over the reset"))
+}

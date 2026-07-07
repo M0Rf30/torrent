@@ -60,6 +60,15 @@ import (
 
 var errTorrentClosed = errors.New("torrent closed")
 
+// Fork-local fix (see CHANGELOG.md): number of CONSECUTIVE storage errors
+// setCachedPieceCompletionFromStorage tolerates before actually disabling
+// data download for the torrent. A single transient error (lock
+// contention, a momentary I/O blip) is logged and ignored; only a streak
+// this long - which any intervening success resets to zero - trips the
+// safety net, matching the original intent (protect against a genuinely
+// broken storage backend) without killing a torrent on one hiccup.
+const pieceCompletionErrorDisableThreshold = 3
+
 type torrentSlogGroupInput struct {
 	name        any
 	canonicalIh shortInfohash
@@ -83,8 +92,16 @@ type Torrent struct {
 
 	networkingEnabled      chansync.Flag
 	dataDownloadDisallowed chansync.Flag
-	dataUploadDisallowed   bool
-	userOnWriteChunkErr    func(error)
+	// Consecutive storage errors seen by setCachedPieceCompletionFromStorage.
+	// Resets to 0 on any successful completion check. A single transient
+	// storage hiccup (e.g. momentary lock contention or an I/O blip) must
+	// not permanently disable an otherwise-healthy torrent - only a
+	// persistent failure crossing pieceCompletionErrorDisableThreshold does
+	// (see disallowDataDownloadLocked call below). Fork-local fix; see
+	// CHANGELOG.md.
+	completionErrorStreak int
+	dataUploadDisallowed  bool
+	userOnWriteChunkErr   func(error)
 
 	closed chansync.SetOnce
 	// A background Context cancelled when the Torrent is closed. Added to minimize extra goroutines
@@ -1789,12 +1806,48 @@ func (t *Torrent) setInitialPieceCompletionFromStorage(piece pieceIndex) {
 	t.afterSetPieceCompletion(piece, true)
 }
 
+// nextCompletionErrorStreak increments `streak` (the running count of
+// CONSECUTIVE piece-completion storage errors seen so far) and reports
+// whether it has now reached pieceCompletionErrorDisableThreshold. Pure
+// function so the threshold/increment logic is unit-testable without
+// constructing a Torrent. Fork-local fix, see CHANGELOG.md.
+func nextCompletionErrorStreak(streak int) (newStreak int, disable bool) {
+	newStreak = streak + 1
+	return newStreak, newStreak >= pieceCompletionErrorDisableThreshold
+}
+
 // Sets the cached piece completion directly from storage.
+//
+// Fork-local fix: a single storage read error used to permanently disable
+// data download for the whole torrent via disallowDataDownloadLocked, with
+// nothing in this codebase ever calling the AllowDataDownload counterpart -
+// so one transient hiccup (lock contention, a momentary I/O blip) killed an
+// otherwise-healthy torrent for the rest of the process's life. Now a
+// bounded number of consecutive errors is tolerated (and logged only as a
+// warning) before the safety net actually trips; any successful check
+// resets the streak, so a real, persistent storage failure still correctly
+// disables downloading exactly as before. See CHANGELOG.md.
 func (t *Torrent) setCachedPieceCompletionFromStorage(piece pieceIndex) bool {
 	uncached := t.pieceCompleteUncached(piece)
 	if uncached.Err != nil {
-		t.slogger().Error("error getting piece completion", "err", uncached.Err)
-		t.disallowDataDownloadLocked()
+		var disable bool
+		t.completionErrorStreak, disable = nextCompletionErrorStreak(t.completionErrorStreak)
+		if disable {
+			t.slogger().Error(
+				"error getting piece completion, disabling data download",
+				"err", uncached.Err,
+				"consecutiveErrors", t.completionErrorStreak,
+			)
+			t.disallowDataDownloadLocked()
+		} else {
+			t.slogger().Warn(
+				"transient error getting piece completion, will retry",
+				"err", uncached.Err,
+				"consecutiveErrors", t.completionErrorStreak,
+			)
+		}
+	} else {
+		t.completionErrorStreak = 0
 	}
 	return t.setCachedPieceCompletion(piece, g.OptionFromTuple(uncached.Complete, uncached.Ok))
 }
