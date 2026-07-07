@@ -789,7 +789,8 @@ func (cl *Client) dopplegangerAddr(addr string) bool {
 // Returns a connection over UTP or TCP, whichever is first to connect.
 func DialFirst(ctx context.Context, addr string, dialers []Dialer) (res DialResult) {
 	pool := dialPool{
-		addr: addr,
+		resCh: make(chan DialResult),
+		addr:  addr,
 	}
 	defer pool.startDrainer()
 	for _, _s := range dialers {
