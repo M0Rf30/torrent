@@ -625,6 +625,7 @@ func (me *regularTrackerAnnounceDispatcher) singleAnnounceAttempter(key torrentT
 		me.updateAnnounceState(key, func(state *announceState) {
 			state.Err = errors.New("announce skipped: Torrent GCed")
 			state.lastAttemptCompleted = time.Now()
+			state.lastAttemptEvent = event
 		})
 		me.updateTimer()
 	} else {
@@ -667,6 +668,7 @@ func (me *regularTrackerAnnounceDispatcher) singleAnnounce(
 	me.updateAnnounceState(key, func(state *announceState) {
 		state.Err = err
 		state.lastAttemptCompleted = now
+		state.lastAttemptEvent = event
 		if err == nil {
 			state.lastOk = lastAnnounceOk{
 				AnnouncedEvent: req.Event,
@@ -701,6 +703,7 @@ func (me *regularTrackerAnnounceDispatcher) resetAnnounceStateForReadd(key torre
 		state.Err = nil
 		state.lastAttemptCompleted = time.Time{}
 		state.sentCompleted = false
+		state.lastAttemptEvent = tracker.None
 	})
 }
 
@@ -839,16 +842,21 @@ func (me *regularTrackerAnnounceDispatcher) nextAnnounceEvent(key torrentTracker
 	lastOk := state.lastOk
 	t := me.torrentFromShortInfohash(key.ShortInfohash)
 	if t == nil {
-		// Our lastOk attempt was an error.
-		if state.Err != nil {
-			return
-		}
-		// We've never announced
+		// We've never announced, so the tracker has nothing to forget about us.
 		if lastOk.Completed.IsZero() {
 			return
 		}
-		// We already left
+		// We already told the tracker we left.
 		if lastOk.AnnouncedEvent == tracker.Stopped {
+			return
+		}
+		// We haven't confirmed leaving yet, and the tracker doesn't otherwise learn we left the
+		// swarm. Even if the last attempt for this (torrent, tracker) pair errored, still make
+		// one best-effort attempt to send Stopped here (BitTorrent protocol compliance), same as
+		// the no-error case just above. Bounded to a single retry: once a Stopped attempt itself
+		// has been made and failed, give up rather than holding this dropped torrent's announce
+		// state forever (see 8f761aeb for the sibling fix to a one-shot-error-wedges-state bug).
+		if state.Err != nil && state.lastAttemptEvent == tracker.Stopped {
 			return
 		}
 		return tracker.Stopped, time.Now()
@@ -888,6 +896,9 @@ type announceState struct {
 	lastAttemptCompleted time.Time
 	// Has ever sent completed event. Should only be sent once.
 	sentCompleted bool
+	// Event of the most recent announce attempt, win or lose. Used to bound retries of a
+	// best-effort Stopped send when a torrent is dropped right after an errored attempt.
+	lastAttemptEvent tracker.AnnounceEvent
 }
 
 func (cl *Client) startTrackerAnnouncer(u *url.URL, urlStr trackerAnnouncerKey) {

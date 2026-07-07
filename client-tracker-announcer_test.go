@@ -96,3 +96,61 @@ func TestReAddForcesFreshStartedAnnounce(t *testing.T) {
 	qt.Assert(t, qt.IsFalse(state.sentCompleted))
 	qt.Assert(t, qt.IsNil(state.Err))
 }
+
+// Regression test: if a torrent is dropped right after its last announce attempt for a tracker
+// errored, nextAnnounceEvent must still schedule a best-effort Stopped event instead of silently
+// discarding the announce state, which would leave stale swarm membership on the tracker (BEP 3
+// requires a Stopped event on leaving). It must also not retry indefinitely if that Stopped
+// attempt itself fails.
+func TestDroppedTorrentWithErroredAnnounceStillSendsStopped(t *testing.T) {
+	cl := &Client{
+		config:              &ClientConfig{TorrentPeersLowWater: 50},
+		torrents:            make(map[*Torrent]struct{}),
+		torrentsByShortHash: make(map[shortInfohash]*Torrent),
+	}
+	// The torrent is deliberately absent from cl.torrentsByShortHash, simulating that it has
+	// already been dropped from the client.
+
+	var key torrentTrackerAnnouncerKey
+	key.ShortInfohash[0] = 1
+	key.url = trackerAnnouncerKey("http://tracker.example/announce")
+
+	d := regularTrackerAnnounceDispatcher{torrentClient: cl, logger: slog.Default()}
+	d.initTables()
+	d.initTimerNoop()
+	u, err := url.Parse(string(key.url))
+	qt.Assert(t, qt.IsNil(err))
+	d.initTrackerClient(u, key.url, cl.config, slog.Default())
+
+	d.announceStates = map[torrentTrackerAnnouncerKey]*announceState{
+		key: {
+			// We successfully joined the swarm previously...
+			lastOk: lastAnnounceOk{
+				AnnouncedEvent: tracker.Started,
+				Completed:      time.Now().Add(-time.Hour),
+				Interval:       time.Minute,
+			},
+			// ...but the most recent announce attempt (e.g. a keep-alive renewal) failed.
+			Err:                  errors.New("tracker unreachable"),
+			lastAttemptCompleted: time.Now(),
+			lastAttemptEvent:     tracker.None,
+		},
+	}
+
+	event, when := d.nextAnnounceEvent(key)
+	qt.Assert(t, qt.Equals(event, tracker.Stopped),
+		qt.Commentf("dropping a torrent after an errored announce must still attempt a best-effort Stopped event"))
+	qt.Assert(t, qt.IsFalse(when.IsZero()))
+
+	// Now simulate that the best-effort Stopped attempt itself failed, as singleAnnounce would
+	// record it. We must not retry Stopped indefinitely for a torrent that's already gone.
+	state := d.announceStates[key]
+	state.Err = errors.New("tracker still unreachable")
+	state.lastAttemptEvent = tracker.Stopped
+	state.lastAttemptCompleted = time.Now()
+
+	event, when = d.nextAnnounceEvent(key)
+	qt.Assert(t, qt.Equals(event, tracker.None),
+		qt.Commentf("must give up, not retry indefinitely, once a Stopped attempt has already failed"))
+	qt.Assert(t, qt.IsTrue(when.IsZero()))
+}
